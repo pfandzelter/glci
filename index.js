@@ -11,6 +11,8 @@ const path = require("path");
 const fs = require("fs-extra");
 const slugify = require("slugify");
 const { performance } = require("perf_hooks");
+const { promisify } = require("util");
+const osExec = promisify(require("child_process").exec);
 
 const define = require("./pre-defined");
 
@@ -73,17 +75,26 @@ function mkdirpRecSync(dir) {
   }
 }
 
-async function execCommands(workdir, container, commands, onerror) {
+async function execCommands({
+  workdir,
+  container,
+  commands,
+  onerror,
+  verbose = true,
+}) {
   for (const command of commands) {
-    console.log(chalk.bold(chalk.green(command)));
+    if (verbose) {
+      console.log(chalk.bold(chalk.green(command)));
+    }
+
     let exec = null;
     let stream = null;
 
     try {
       exec = await container.exec({
         Cmd: ["sh", "-c", command],
-        AttachStdout: true,
-        AttachStderr: true,
+        AttachStdout: verbose,
+        AttachStderr: verbose,
         WorkingDir: workdir,
       });
 
@@ -99,9 +110,12 @@ async function execCommands(workdir, container, commands, onerror) {
         if (inspect.ExitCode !== 0) reject();
         resolve();
       });
-      container.modem.demuxStream(stream, process.stdout, {
-        write: (err) => console.error(chalk.red(err.toString())),
-      });
+
+      if (verbose) {
+        container.modem.demuxStream(stream, process.stdout, {
+          write: (err) => console.error(chalk.red(err.toString())),
+        });
+      }
     });
   }
 }
@@ -123,7 +137,7 @@ async function main() {
 
   // checking mandatory keys
   if (!("stages" in ci)) {
-    ci.stages = ["build", "test", "deploy"]
+    ci.stages = ["build", "test", "deploy"];
   }
 
   //const docker = new Docker();
@@ -393,17 +407,41 @@ async function main() {
         if (job.before_script || DEFAULT.before_script) {
           const commands = job.before_script ?? DEFAULT.before_script;
 
-          await execCommands(workdir, container, commands, onerror);
+          await execCommands({ workdir, container, commands, onerror });
         }
 
         // running script
-        await execCommands(workdir, container, job.script, onerror);
+        await execCommands({
+          workdir,
+          container,
+          commands: job.script,
+          onerror,
+        });
 
         // running after_script
         if (job.after_script || DEFAULT.after_script) {
           const commands = job.after_script ?? DEFAULT.after_script;
 
-          await execCommands(workdir, container, commands, onerror);
+          await execCommands({ workdir, container, commands, onerror });
+        }
+
+        // hack for linux: chown -R <workdir>/ inside container to fix root permissions
+        // TODO: do other platforms need the hack ?
+        if (process.platform === "linux") {
+          const { stdout, stderr } = await osExec("id -u");
+
+          if (stderr) {
+            await onerror(stderr, container);
+          } else if (stdout.trim()) {
+            const commands = [`chown -R ${stdout.trim()}: ${workdir}`];
+            await execCommands({
+              workdir,
+              container,
+              commands,
+              onerror,
+              verbose: false,
+            });
+          }
         }
 
         // updating cache directory (if policy asks) after job ended
